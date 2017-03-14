@@ -1,195 +1,265 @@
-10a11
-> import copy
-18a20
-> from chainer import reporter as reporter_module
-24a27
->         n_layer = 2
-27,29c30,31
-<             l1=L.LSTM(n_units, n_units),
-<             l2=L.LSTM(n_units, n_units),
-<             l3=L.Linear(n_units, n_vocab),
----
->             l1=L.NStepLSTM(n_layer, n_units, n_units, 0.5, True),
->             l2=L.Linear(n_units, n_vocab),
-31,32d32
-<         for param in self.params():
-<             param.data[...] = np.random.uniform(-0.1, 0.1, param.data.shape)
-33a34,35
->         self.n_layer = n_layer
->         self.n_units = n_units
-35,43c37,48
-<     def reset_state(self):
-<         self.l1.reset_state()
-<         self.l2.reset_state()
-< 
-<     def __call__(self, x):
-<         h0 = self.embed(x)
-<         h1 = self.l1(F.dropout(h0, train=self.train))
-<         h2 = self.l2(F.dropout(h1, train=self.train))
-<         y = self.l3(F.dropout(h2, train=self.train))
----
->     def __call__(self, xs):
->         x_len = [len(x) for x in xs]
->         x_section = np.cumsum(x_len[:-1])
->         ex = self.embed(F.concat(xs, axis=0))
->         exs = F.split_axis(ex, x_section, 0, force_tuple=True)
-> 
->         xp = self.xp
->         volatile = xs[0].volatile
->         hx = chainer.Variable(xp.zeros((self.n_layer, len(xs), self.n_units), dtype=xp.float32), volatile=volatile)
->         cx = chainer.Variable(xp.zeros((self.n_layer, len(xs), self.n_units), dtype=xp.float32), volatile=volatile)
->         _, _, ys = self.l1(hx, cx, exs, train=self.train)
->         y = [self.l2(F.dropout(i, train=self.train)) for i in ys]
-53c58
-<     def __init__(self, dataset, batch_size, repeat=True):
----
->     def __init__(self, dataset, batch_size, bprop_len, repeat=True):
-55a61
->         self.bprop_len = bprop_len
-86c92
-<         epoch = self.iteration * self.batch_size // length
----
->         epoch = self.iteration * self.batch_size * self.bprop_len // length
-96c102
-<         return self.iteration * self.batch_size / len(self.dataset)
----
->         return self.iteration * self.batch_size * self.bprop_len / len(self.dataset)
-99,101c105,113
-<         # It returns a list of current words.
-<         return [self.dataset[(offset + self.iteration) % len(self.dataset)]
-<                 for offset in self.offsets]
----
->         items = []
->         for offset in self.offsets:
->             start = (offset + self.iteration) % len(self.dataset)
->             item = self.dataset[start : start+self.bprop_len]
->             if start+self.bprop_len > len(self.dataset):
->                 items.append(np.concatenate((item, self.dataset[:start + self.bprop_len - len(self.dataset)])))
->             else:
->                 items.append(item)
->         return items
-108a121,146
-> def convert(batch, device):
->     if device is None:
->         def to_device(x):
->             return x
->     elif device < 0:
->         to_device = chainer.cuda.to_cpu
->     else:
->         def to_device(x):
->             return chainer.cuda.to_gpu(x, device, chainer.cuda.Stream.null)
-> 
->     def to_device_batch(batch):
->         if device is None:
->             return batch
->         elif device < 0:
->             return [to_device(x) for x in batch]
->         else:
->             xp = chainer.cuda.cupy.get_array_module(*batch)
->             concat = xp.concatenate(batch, axis=0)
->             sections = np.cumsum([len(x) for x in batch[:-1]], dtype='i')
->             concat_dev = to_device(concat)
->             batch_dev = chainer.cuda.cupy.split(concat_dev, sections)
->             return batch_dev
-> 
->     return tuple([to_device_batch([x for x, _ in batch]), to_device_batch([y for _, y in batch])])
-> 
-> 
-112c150
-<     def __init__(self, train_iter, optimizer, bprop_len, device):
----
->     def __init__(self, train_iter, optimizer, device):
-114,115c152
-<             train_iter, optimizer, device=device)
-<         self.bprop_len = bprop_len
----
->             train_iter, optimizer, converter=convert, device=device)
-119d155
-<         loss = 0
-126,133c162,163
-<         for i in range(self.bprop_len):
-<             # Get the next batch (a list of tuples of two word IDs)
-<             batch = train_iter.__next__()
-< 
-<             # Concatenate the word IDs to matrices and send them to the device
-<             # self.converter does this job
-<             # (it is chainer.dataset.concat_examples by default)
-<             x, t = self.converter(batch, self.device)
----
->         # Get the next batch (a list of tuples of two word IDs)
->         batch = train_iter.__next__()
-135,136c165,171
-<             # Compute the loss at this time step and accumulate it
-<             loss += optimizer.target(chainer.Variable(x), chainer.Variable(t))
----
->         # Concatenate the word IDs to matrices and send them to the device
->         # self.converter does this job
->         # (it is chainer.dataset.concat_examples by default)
->         xs, ts = self.converter(batch, self.device)
-> 
->         # Compute the loss at this time step and accumulate it
->         loss = optimizer.target([chainer.Variable(x) for x in xs], [chainer.Variable(t) for t in ts])
-143a179,212
-> class BPTTEvaluator(training.extensions.Evaluator):
-> 
->     def __init__(self, iterator, target, device):
->         super(BPTTEvaluator, self).__init__(
->             iterator, target, converter=convert, device=device)
-> 
->     def evaluate(self):
->         iterator = self._iterators['main']
->         target = self._targets['main']
->         eval_func = self.eval_func or target
-> 
->         if self.eval_hook:
->             self.eval_hook(self)
->         it = copy.copy(iterator)
->         summary = reporter_module.DictSummary()
-> 
->         for batch in it:
->             observation = {}
->             with reporter_module.report_scope(observation):
->                 xs, ts = self.converter(batch, self.device)
->                 eval_func([chainer.Variable(x, volatile='on') for x in xs], [chainer.Variable(t, volatile='on') for t in ts])
-> 
->             summary.add(observation)
-> 
->         return summary.compute_mean()
-> 
-> 
-> def sum_softmax_cross_entropy(ys, ts):
->     loss = 0
->     for y, t in zip(ys, ts):
->         loss += chainer.functions.softmax_cross_entropy(y, t)
->     return loss
-> 
-> 
-186,188c255,257
-<     train_iter = ParallelSequentialIterator(train, args.batchsize)
-<     val_iter = ParallelSequentialIterator(val, 1, repeat=False)
-<     test_iter = ParallelSequentialIterator(test, 1, repeat=False)
----
->     train_iter = ParallelSequentialIterator(train, args.batchsize, args.bproplen)
->     val_iter = ParallelSequentialIterator(val, 1, args.bproplen, repeat=False)
->     test_iter = ParallelSequentialIterator(test, 1, args.bproplen, repeat=False)
-192c261
-<     model = L.Classifier(rnn)
----
->     model = L.Classifier(rnn, lossfun=sum_softmax_cross_entropy)
-204c273
-<     updater = BPTTUpdater(train_iter, optimizer, args.bproplen, args.gpu)
----
->     updater = BPTTUpdater(train_iter, optimizer, args.gpu)
-210,213c279,280
-<     trainer.extend(extensions.Evaluator(
-<         val_iter, eval_model, device=args.gpu,
-<         # Reset the RNN state at the beginning of each evaluation
-<         eval_hook=lambda _: eval_rnn.reset_state()))
----
->     trainer.extend(BPTTEvaluator(
->         val_iter, eval_model, device=args.gpu))
-233,234c300
-<     eval_rnn.reset_state()
-<     evaluator = extensions.Evaluator(test_iter, eval_model, device=args.gpu)
----
->     evaluator = BPTTEvaluator(test_iter, eval_model, device=args.gpu)
+--- train_ptb.py	2017-03-13 17:40:24.837817231 +0900
++++ train_ptb_nstep.py	2017-03-14 15:23:16.760270705 +0900
+@@ -8,6 +8,7 @@
+ from __future__ import division
+ from __future__ import print_function
+ import argparse
++import copy
+ 
+ import numpy as np
+ 
+@@ -16,31 +17,35 @@
+ import chainer.links as L
+ from chainer import training
+ from chainer.training import extensions
++from chainer import reporter as reporter_module
+ 
+ 
+ # Definition of a recurrent net for language modeling
+ class RNNForLM(chainer.Chain):
+ 
+     def __init__(self, n_vocab, n_units, train=True):
++        n_layer = 2
+         super(RNNForLM, self).__init__(
+             embed=L.EmbedID(n_vocab, n_units),
+-            l1=L.LSTM(n_units, n_units),
+-            l2=L.LSTM(n_units, n_units),
+-            l3=L.Linear(n_units, n_vocab),
++            l1=L.NStepLSTM(n_layer, n_units, n_units, 0.5, True),
++            l2=L.Linear(n_units, n_vocab),
+         )
+-        for param in self.params():
+-            param.data[...] = np.random.uniform(-0.1, 0.1, param.data.shape)
+         self.train = train
++        self.n_layer = n_layer
++        self.n_units = n_units
+ 
+-    def reset_state(self):
+-        self.l1.reset_state()
+-        self.l2.reset_state()
+-
+-    def __call__(self, x):
+-        h0 = self.embed(x)
+-        h1 = self.l1(F.dropout(h0, train=self.train))
+-        h2 = self.l2(F.dropout(h1, train=self.train))
+-        y = self.l3(F.dropout(h2, train=self.train))
++    def __call__(self, xs):
++        x_len = [len(x) for x in xs]
++        x_section = np.cumsum(x_len[:-1])
++        ex = self.embed(F.concat(xs, axis=0))
++        exs = F.split_axis(ex, x_section, 0, force_tuple=True)
++
++        xp = self.xp
++        volatile = xs[0].volatile
++        hx = chainer.Variable(xp.zeros((self.n_layer, len(xs), self.n_units), dtype=xp.float32), volatile=volatile)
++        cx = chainer.Variable(xp.zeros((self.n_layer, len(xs), self.n_units), dtype=xp.float32), volatile=volatile)
++        _, _, ys = self.l1(hx, cx, exs, train=self.train)
++        y = [self.l2(F.dropout(i, train=self.train)) for i in ys]
+         return y
+ 
+ 
+@@ -50,9 +55,10 @@
+ # equally spaced within the whole sequence.
+ class ParallelSequentialIterator(chainer.dataset.Iterator):
+ 
+-    def __init__(self, dataset, batch_size, repeat=True):
++    def __init__(self, dataset, batch_size, bprop_len, repeat=True):
+         self.dataset = dataset
+         self.batch_size = batch_size  # batch size
++        self.bprop_len = bprop_len
+         # Number of completed sweeps over the dataset. In this case, it is
+         # incremented if every word is visited at least once after the last
+         # increment.
+@@ -83,7 +89,7 @@
+         self.iteration += 1
+         next_words = self.get_words()
+ 
+-        epoch = self.iteration * self.batch_size // length
++        epoch = self.iteration * self.batch_size * self.bprop_len // length
+         self.is_new_epoch = self.epoch < epoch
+         if self.is_new_epoch:
+             self.epoch = epoch
+@@ -93,12 +99,18 @@
+     @property
+     def epoch_detail(self):
+         # Floating point version of epoch.
+-        return self.iteration * self.batch_size / len(self.dataset)
++        return self.iteration * self.batch_size * self.bprop_len / len(self.dataset)
+ 
+     def get_words(self):
+-        # It returns a list of current words.
+-        return [self.dataset[(offset + self.iteration) % len(self.dataset)]
+-                for offset in self.offsets]
++        items = []
++        for offset in self.offsets:
++            start = (offset + self.iteration) % len(self.dataset)
++            item = self.dataset[start : start+self.bprop_len]
++            if start+self.bprop_len > len(self.dataset):
++                items.append(np.concatenate((item, self.dataset[:start + self.bprop_len - len(self.dataset)])))
++            else:
++                items.append(item)
++        return items
+ 
+     def serialize(self, serializer):
+         # It is important to serialize the state to be recovered on resume.
+@@ -106,34 +118,57 @@
+         self.epoch = serializer('epoch', self.epoch)
+ 
+ 
++def convert(batch, device):
++    if device is None:
++        def to_device(x):
++            return x
++    elif device < 0:
++        to_device = chainer.cuda.to_cpu
++    else:
++        def to_device(x):
++            return chainer.cuda.to_gpu(x, device, chainer.cuda.Stream.null)
++
++    def to_device_batch(batch):
++        if device is None:
++            return batch
++        elif device < 0:
++            return [to_device(x) for x in batch]
++        else:
++            xp = chainer.cuda.cupy.get_array_module(*batch)
++            concat = xp.concatenate(batch, axis=0)
++            sections = np.cumsum([len(x) for x in batch[:-1]], dtype='i')
++            concat_dev = to_device(concat)
++            batch_dev = chainer.cuda.cupy.split(concat_dev, sections)
++            return batch_dev
++
++    return tuple([to_device_batch([x for x, _ in batch]), to_device_batch([y for _, y in batch])])
++
++
+ # Custom updater for truncated BackProp Through Time (BPTT)
+ class BPTTUpdater(training.StandardUpdater):
+ 
+-    def __init__(self, train_iter, optimizer, bprop_len, device):
++    def __init__(self, train_iter, optimizer, device):
+         super(BPTTUpdater, self).__init__(
+-            train_iter, optimizer, device=device)
+-        self.bprop_len = bprop_len
++            train_iter, optimizer, converter=convert, device=device)
+ 
+     # The core part of the update routine can be customized by overriding.
+     def update_core(self):
+-        loss = 0
+         # When we pass one iterator and optimizer to StandardUpdater.__init__,
+         # they are automatically named 'main'.
+         train_iter = self.get_iterator('main')
+         optimizer = self.get_optimizer('main')
+ 
+         # Progress the dataset iterator for bprop_len words at each iteration.
+-        for i in range(self.bprop_len):
+-            # Get the next batch (a list of tuples of two word IDs)
+-            batch = train_iter.__next__()
+-
+-            # Concatenate the word IDs to matrices and send them to the device
+-            # self.converter does this job
+-            # (it is chainer.dataset.concat_examples by default)
+-            x, t = self.converter(batch, self.device)
++        # Get the next batch (a list of tuples of two word IDs)
++        batch = train_iter.__next__()
+ 
+-            # Compute the loss at this time step and accumulate it
+-            loss += optimizer.target(chainer.Variable(x), chainer.Variable(t))
++        # Concatenate the word IDs to matrices and send them to the device
++        # self.converter does this job
++        # (it is chainer.dataset.concat_examples by default)
++        xs, ts = self.converter(batch, self.device)
++
++        # Compute the loss at this time step and accumulate it
++        loss = optimizer.target([chainer.Variable(x) for x in xs], [chainer.Variable(t) for t in ts])
+ 
+         optimizer.target.cleargrads()  # Clear the parameter gradients
+         loss.backward()  # Backprop
+@@ -141,6 +176,40 @@
+         optimizer.update()  # Update the parameters
+ 
+ 
++class BPTTEvaluator(training.extensions.Evaluator):
++
++    def __init__(self, iterator, target, device):
++        super(BPTTEvaluator, self).__init__(
++            iterator, target, converter=convert, device=device)
++
++    def evaluate(self):
++        iterator = self._iterators['main']
++        target = self._targets['main']
++        eval_func = self.eval_func or target
++
++        if self.eval_hook:
++            self.eval_hook(self)
++        it = copy.copy(iterator)
++        summary = reporter_module.DictSummary()
++
++        for batch in it:
++            observation = {}
++            with reporter_module.report_scope(observation):
++                xs, ts = self.converter(batch, self.device)
++                eval_func([chainer.Variable(x, volatile='on') for x in xs], [chainer.Variable(t, volatile='on') for t in ts])
++
++            summary.add(observation)
++
++        return summary.compute_mean()
++
++
++def sum_softmax_cross_entropy(ys, ts):
++    loss = 0
++    for y, t in zip(ys, ts):
++        loss += chainer.functions.softmax_cross_entropy(y, t)
++    return loss
++
++
+ # Routine to rewrite the result dictionary of LogReport to add perplexity
+ # values
+ def compute_perplexity(result):
+@@ -183,13 +252,13 @@
+         val = val[:100]
+         test = test[:100]
+ 
+-    train_iter = ParallelSequentialIterator(train, args.batchsize)
+-    val_iter = ParallelSequentialIterator(val, 1, repeat=False)
+-    test_iter = ParallelSequentialIterator(test, 1, repeat=False)
++    train_iter = ParallelSequentialIterator(train, args.batchsize, args.bproplen)
++    val_iter = ParallelSequentialIterator(val, 1, args.bproplen, repeat=False)
++    test_iter = ParallelSequentialIterator(test, 1, args.bproplen, repeat=False)
+ 
+     # Prepare an RNNLM model
+     rnn = RNNForLM(n_vocab, args.unit)
+-    model = L.Classifier(rnn)
++    model = L.Classifier(rnn, lossfun=sum_softmax_cross_entropy)
+     model.compute_accuracy = False  # we only want the perplexity
+     if args.gpu >= 0:
+         chainer.cuda.get_device(args.gpu).use()  # make the GPU current
+@@ -201,16 +270,14 @@
+     optimizer.add_hook(chainer.optimizer.GradientClipping(args.gradclip))
+ 
+     # Set up a trainer
+-    updater = BPTTUpdater(train_iter, optimizer, args.bproplen, args.gpu)
++    updater = BPTTUpdater(train_iter, optimizer, args.gpu)
+     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.out)
+ 
+     eval_model = model.copy()  # Model with shared params and distinct states
+     eval_rnn = eval_model.predictor
+     eval_rnn.train = False
+-    trainer.extend(extensions.Evaluator(
+-        val_iter, eval_model, device=args.gpu,
+-        # Reset the RNN state at the beginning of each evaluation
+-        eval_hook=lambda _: eval_rnn.reset_state()))
++    trainer.extend(BPTTEvaluator(
++        val_iter, eval_model, device=args.gpu))
+ 
+     interval = 10 if args.test else 500
+     trainer.extend(extensions.LogReport(postprocess=compute_perplexity,
+@@ -230,8 +297,7 @@
+ 
+     # Evaluate the final model
+     print('test')
+-    eval_rnn.reset_state()
+-    evaluator = extensions.Evaluator(test_iter, eval_model, device=args.gpu)
++    evaluator = BPTTEvaluator(test_iter, eval_model, device=args.gpu)
+     result = evaluator()
+     print('test perplexity:', np.exp(float(result['main/loss'])))
+ 
